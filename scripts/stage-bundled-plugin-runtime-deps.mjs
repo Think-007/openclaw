@@ -3,8 +3,6 @@ import fs from "node:fs";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 
-const WINDOWS_UNSAFE_CMD_CHARS_RE = /[&|<>^%\r\n]/;
-
 function readJson(filePath) {
   return JSON.parse(fs.readFileSync(filePath, "utf8"));
 }
@@ -84,138 +82,70 @@ function sanitizeBundledManifestForRuntimeInstall(pluginDir) {
   }
 }
 
-export function resolveNpmRunner(params = {}) {
-  const execPath = params.execPath ?? process.execPath;
-  const npmArgs = params.npmArgs ?? [];
-  const existsSync = params.existsSync ?? fs.existsSync;
-  const env = params.env ?? process.env;
-  const platform = params.platform ?? process.platform;
-  const comSpec = params.comSpec ?? env.ComSpec ?? "cmd.exe";
-  const pathImpl = platform === "win32" ? path.win32 : path.posix;
-  const nodeDir = pathImpl.dirname(execPath);
-  const npmToolchain = resolveToolchainNpmRunner({
-    comSpec,
-    existsSync,
-    nodeDir,
-    npmArgs,
-    pathImpl,
-    platform,
-  });
-  if (npmToolchain) {
-    return npmToolchain;
-  }
-  if (platform === "win32") {
-    const expectedPaths = [
-      pathImpl.resolve(nodeDir, "../lib/node_modules/npm/bin/npm-cli.js"),
-      pathImpl.resolve(nodeDir, "node_modules/npm/bin/npm-cli.js"),
-      pathImpl.resolve(nodeDir, "npm.exe"),
-      pathImpl.resolve(nodeDir, "npm.cmd"),
-    ];
-    throw new Error(
-      `failed to resolve a toolchain-local npm next to ${execPath}. ` +
-        `Checked: ${expectedPaths.join(", ")}. ` +
-        "OpenClaw refuses to shell out to bare npm on Windows; install a Node.js toolchain that bundles npm or run with a matching Node installation.",
-    );
-  }
-  const pathKey = resolvePathEnvKey(env);
-  const currentPath = env[pathKey];
-  return {
-    command: "npm",
-    args: npmArgs,
-    shell: false,
-    env: {
-      ...env,
-      [pathKey]:
-        typeof currentPath === "string" && currentPath.length > 0
-          ? `${nodeDir}${path.delimiter}${currentPath}`
-          : nodeDir,
-    },
-  };
-}
-
-function resolveToolchainNpmRunner(params) {
-  const npmCliCandidates = [
-    params.pathImpl.resolve(params.nodeDir, "../lib/node_modules/npm/bin/npm-cli.js"),
-    params.pathImpl.resolve(params.nodeDir, "node_modules/npm/bin/npm-cli.js"),
-  ];
-  const npmCliPath = npmCliCandidates.find((candidate) => params.existsSync(candidate));
-  if (npmCliPath) {
-    return {
-      command:
-        params.platform === "win32"
-          ? params.pathImpl.join(params.nodeDir, "node.exe")
-          : params.pathImpl.join(params.nodeDir, "node"),
-      args: [npmCliPath, ...params.npmArgs],
-      shell: false,
-    };
-  }
-  if (params.platform !== "win32") {
-    return null;
-  }
-  const npmExePath = params.pathImpl.resolve(params.nodeDir, "npm.exe");
-  if (params.existsSync(npmExePath)) {
-    return {
-      command: npmExePath,
-      args: params.npmArgs,
-      shell: false,
-    };
-  }
-  const npmCmdPath = params.pathImpl.resolve(params.nodeDir, "npm.cmd");
-  if (params.existsSync(npmCmdPath)) {
-    return {
-      command: params.comSpec,
-      args: ["/d", "/s", "/c", buildCmdExeCommandLine(npmCmdPath, params.npmArgs)],
-      shell: false,
-      windowsVerbatimArguments: true,
-    };
-  }
-  return null;
-}
-
-function resolvePathEnvKey(env) {
-  return Object.keys(env).find((key) => key.toLowerCase() === "path") ?? "PATH";
-}
-
-function escapeForCmdExe(arg) {
-  if (WINDOWS_UNSAFE_CMD_CHARS_RE.test(arg)) {
-    throw new Error(`unsafe Windows cmd.exe argument detected: ${JSON.stringify(arg)}`);
-  }
-  if (!arg.includes(" ") && !arg.includes('"')) {
-    return arg;
-  }
-  return `"${arg.replace(/"/g, '""')}"`;
-}
-
-function buildCmdExeCommandLine(command, args) {
-  return [escapeForCmdExe(command), ...args.map(escapeForCmdExe)].join(" ");
-}
-
 function installPluginRuntimeDeps(pluginDir, pluginId) {
   sanitizeBundledManifestForRuntimeInstall(pluginDir);
-  const npmRunner = resolveNpmRunner({
-    npmArgs: [
-      "install",
-      "--omit=dev",
-      "--silent",
-      "--ignore-scripts",
-      "--legacy-peer-deps",
-      "--package-lock=false",
-    ],
-  });
-  const result = spawnSync(npmRunner.command, npmRunner.args, {
+  const opts = {
     cwd: pluginDir,
     encoding: "utf8",
-    env: npmRunner.env,
     stdio: "pipe",
-    shell: npmRunner.shell,
-    windowsVerbatimArguments: npmRunner.windowsVerbatimArguments,
-  });
-  if (result.status === 0) {
+    shell: process.platform === "win32",
+  };
+
+  // runtime deps staging 只需要 node_modules，不保留 lock 文件（避免污染产物）。
+  function cleanupLockFiles() {
+    for (const lockName of ["pnpm-lock.yaml", "package-lock.json"]) {
+      const lockPath = path.join(pluginDir, lockName);
+      if (fs.existsSync(lockPath)) {
+        fs.rmSync(lockPath, { force: true });
+      }
+    }
+  }
+
+  const pnpmResult = spawnSync(
+    "pnpm",
+    [
+      "install",
+      "--prod",
+      "--ignore-scripts",
+      "--no-strict-peer-dependencies",
+      "--ignore-workspace",
+      "--no-lockfile",
+    ],
+    opts,
+  );
+  if (pnpmResult.status === 0) {
+    cleanupLockFiles();
     return;
   }
-  const output = [result.stderr, result.stdout].filter(Boolean).join("\n").trim();
+
+  const npmResult = spawnSync(
+    "npm",
+    [
+      "install",
+      "--omit=dev",
+      "--ignore-scripts",
+      "--legacy-peer-deps",
+      "--no-package-lock",
+    ],
+    opts,
+  );
+  if (npmResult.status === 0) {
+    cleanupLockFiles();
+    return;
+  }
+
+  const parts = [
+    pnpmResult.error?.message,
+    pnpmResult.stderr,
+    pnpmResult.stdout,
+    "--- npm fallback ---",
+    npmResult.error?.message,
+    npmResult.stderr,
+    npmResult.stdout,
+  ].filter(Boolean);
+  const output = parts.join("\n").trim();
   throw new Error(
-    `failed to stage bundled runtime deps for ${pluginId}: ${output || "npm install failed"}`,
+    `failed to stage bundled runtime deps for ${pluginId}: ${output || "pnpm/npm install failed"}`,
   );
 }
 
